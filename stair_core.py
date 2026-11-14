@@ -40,15 +40,43 @@ def predict_leaf(question,toc,adapter_path=None):
     return candidates[int(np.argmax(c @ q[0]))] if candidates else None
 
 def retrieve_evidence(question, text, toc):
-    sections=attach_sections(text,toc)
-    if not sections: return []
-    emb=load_embedder()
-    q=emb.encode([question],normalize_embeddings=True)
-    docs=[s["title"]+"\n"+s["text"][:7000] for s in sections]
-    d=emb.encode(docs,normalize_embeddings=True)
-    scores=d @ q[0]
-    order=np.argsort(scores)[::-1][:3]
-    return [{**sections[i],"score":float(scores[i])} for i in order]
+    sections = attach_sections(text, toc)
+
+    # Also create page-based chunks as a fallback.
+    pages = re.split(r"\[PAGE\s+(\d+)\]", text)
+
+    page_chunks = []
+    for i in range(1, len(pages), 2):
+        page_no = pages[i]
+        page_text = pages[i + 1].strip()
+
+        if page_text:
+            page_chunks.append({
+                "title": f"PDF Page {page_no}",
+                "text": page_text,
+                "start_line": 0,
+                "end_line": 0
+            })
+
+    candidates = sections + page_chunks
+
+    emb = load_embedder()
+    q = emb.encode([question], normalize_embeddings=True)
+
+    docs = [
+        item["title"] + "\n" + item["text"][:7000]
+        for item in candidates
+    ]
+
+    d = emb.encode(docs, normalize_embeddings=True)
+    scores = d @ q[0]
+
+    order = np.argsort(scores)[::-1][:5]
+
+    return [
+        {**candidates[i], "score": float(scores[i])}
+        for i in order
+    ]
 
 def answer_with_openrouter(question,evidence):
     import requests
