@@ -1,5 +1,6 @@
 
 import os
+import tempfile
 import streamlit as st
 from pathlib import Path
 
@@ -11,9 +12,10 @@ from stair_core import (
     answer_with_openrouter
 )
 
-# --------------------------------------------------
-# 1. Streamlit configuration
-# --------------------------------------------------
+
+# ==================================================
+# 1. STREAMLIT CONFIGURATION
+# ==================================================
 
 st.set_page_config(
     page_title="Finance STAIR-RAG",
@@ -22,22 +24,30 @@ st.set_page_config(
 )
 
 st.title("📊 Finance STAIR-RAG")
-st.caption(
+
+st.markdown(
     "Structure-Aware Retrieval-Augmented Generation "
     "for Financial Annual Reports"
 )
 
-# --------------------------------------------------
-# 2. Load API configuration
-# --------------------------------------------------
+st.divider()
+
+
+# ==================================================
+# 2. LOAD API CONFIGURATION
+# ==================================================
 
 def get_secret(key, default=""):
+
     try:
         return st.secrets.get(key, default)
+
     except Exception:
         return os.getenv(key, default)
 
+
 api_key = get_secret("OPENROUTER_API_KEY")
+
 model_name = get_secret(
     "OPENROUTER_MODEL",
     "openai/gpt-4o-mini"
@@ -48,18 +58,67 @@ if api_key:
 
 os.environ["OPENROUTER_MODEL"] = model_name
 
-# --------------------------------------------------
-# 3. Session state
-# --------------------------------------------------
+
+# ==================================================
+# 3. SESSION STATE
+# ==================================================
 
 if "documents" not in st.session_state:
     st.session_state.documents = {}
 
-# --------------------------------------------------
-# 4. Upload PDFs
-# --------------------------------------------------
 
-st.sidebar.header("Upload Annual Reports")
+# ==================================================
+# 4. FILE PROCESSING FUNCTION
+# ==================================================
+
+def process_uploaded_file(uploaded_file):
+
+    suffix = Path(uploaded_file.name).suffix.lower()
+
+    temp_path = None
+
+    try:
+
+        # Save UploadedFile as a temporary file
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=suffix
+        ) as temp_file:
+
+            temp_file.write(uploaded_file.getvalue())
+
+            temp_path = Path(temp_file.name)
+
+        # Pass Path object to document parser
+        extracted_text = read_file(temp_path)
+
+        if not extracted_text:
+            raise ValueError(
+                "No text was extracted from the document."
+            )
+
+        if not extracted_text.strip():
+            raise ValueError(
+                "The extracted document text is empty."
+            )
+
+        # Generate Table of Contents
+        document_toc = build_toc(extracted_text)
+
+        return extracted_text, document_toc
+
+    finally:
+
+        # Remove temporary file
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+
+
+# ==================================================
+# 5. SIDEBAR - UPLOAD DOCUMENTS
+# ==================================================
+
+st.sidebar.header("📁 Upload Annual Reports")
 
 uploaded_files = st.sidebar.file_uploader(
     "Upload PDF / TXT / DOCX files",
@@ -67,67 +126,79 @@ uploaded_files = st.sidebar.file_uploader(
     accept_multiple_files=True
 )
 
+
 if uploaded_files:
 
     for uploaded_file in uploaded_files:
 
-        if uploaded_file.name not in st.session_state.documents:
+        file_name = uploaded_file.name
+
+        if file_name not in st.session_state.documents:
 
             try:
-                text = read_file(uploaded_file)
 
-                if not text or not text.strip():
-                    st.error(
-                        f"No text extracted from {uploaded_file.name}"
+                with st.spinner(
+                    f"Processing {file_name}..."
+                ):
+
+                    extracted_text, document_toc = (
+                        process_uploaded_file(uploaded_file)
                     )
-                    continue
 
-                toc = build_toc(text)
+                    st.session_state.documents[file_name] = {
+                        "text": extracted_text,
+                        "toc": document_toc
+                    }
 
-                st.session_state.documents[
-                    uploaded_file.name
-                ] = {
-                    "text": text,
-                    "toc": toc
-                }
-
-                st.success(
-                    f"Processed: {uploaded_file.name}"
+                st.sidebar.success(
+                    f"Processed: {file_name}"
                 )
 
-            except Exception as e:
-                st.error(
-                    f"Error processing {uploaded_file.name}: {e}"
+            except Exception as error:
+
+                st.sidebar.error(
+                    f"Error processing {file_name}: {error}"
                 )
 
-# --------------------------------------------------
-# 5. Select document
-# --------------------------------------------------
+
+# ==================================================
+# 6. CHECK DOCUMENT AVAILABILITY
+# ==================================================
 
 if not st.session_state.documents:
 
-    st.info("Upload an annual report PDF to begin.")
+    st.info(
+        "Upload an annual report PDF from the sidebar to begin."
+    )
+
     st.stop()
+
+
+# ==================================================
+# 7. SELECT DOCUMENT
+# ==================================================
+
+st.subheader("Select Annual Report")
 
 document_names = list(
     st.session_state.documents.keys()
 )
 
 selected_document = st.selectbox(
-    "Select Annual Report",
+    "Choose a document",
     document_names
 )
 
-document = st.session_state.documents[
-    selected_document
-]
+document = st.session_state.documents[selected_document]
 
 text = document["text"]
+
 toc = document["toc"]
 
-# --------------------------------------------------
-# 6. Diagnostics
-# --------------------------------------------------
+
+# ==================================================
+# 8. DOCUMENT DIAGNOSTICS
+# ==================================================
 
 with st.expander("📋 Document Diagnostics"):
 
@@ -148,45 +219,57 @@ with st.expander("📋 Document Diagnostics"):
         text.count("[PAGE ")
     )
 
-    st.write("Detected Table of Contents:")
+    st.markdown("### Detected Table of Contents")
 
-    st.code(
-        toc_text(toc)[:12000]
-        if toc else "No headings detected."
-    )
+    if toc:
 
-    if not toc:
+        st.text(
+            toc_text(toc)[:12000]
+        )
+
+    else:
+
         st.warning(
             "No headings detected. Check toc_generator.py."
         )
 
-# --------------------------------------------------
-# 7. Ask question
-# --------------------------------------------------
+    if "[PAGE " not in text:
+
+        st.warning(
+            "Page markers are missing. "
+            "Check whether document_parser.py preserves PDF page numbers."
+        )
+
+
+# ==================================================
+# 9. QUESTION INPUT
+# ==================================================
 
 st.divider()
 
-st.subheader("Ask a Financial Question")
+st.header("🔍 Ask Questions About the Annual Report")
 
 question = st.text_area(
-    "Enter your question:",
+    "Enter your financial question:",
     placeholder=(
-        "Example: What was the expenditure on "
+        "Example: How much did L&T spend on "
         "environmental management in FY 2024-25?"
     ),
     height=100
 )
 
+
 top_k = st.slider(
-    "Number of evidence chunks",
+    "Number of evidence chunks to retrieve",
     min_value=3,
     max_value=10,
     value=5
 )
 
-# --------------------------------------------------
-# 8. Process question
-# --------------------------------------------------
+
+# ==================================================
+# 10. PROCESS QUESTION
+# ==================================================
 
 if st.button(
     "Generate Answer",
@@ -196,57 +279,102 @@ if st.button(
 
     if not question.strip():
 
-        st.warning("Please enter a question.")
+        st.warning(
+            "Please enter a question."
+        )
 
     else:
 
-        with st.spinner("Predicting relevant ToC section..."):
-
-            predicted_leaf = predict_leaf(
-                question,
-                toc
-            )
+        # ------------------------------------------
+        # A. PREDICT RELEVANT TOC SECTION
+        # ------------------------------------------
 
         st.subheader("1. Predicted ToC Section")
 
-        st.write(
-            predicted_leaf
-            if predicted_leaf
-            else "No relevant section predicted."
-        )
+        with st.spinner(
+            "Predicting the relevant section..."
+        ):
+
+            try:
+
+                predicted_leaf = predict_leaf(
+                    question,
+                    toc
+                )
+
+                if predicted_leaf:
+
+                    st.success(predicted_leaf)
+
+                else:
+
+                    st.warning(
+                        "No relevant ToC section predicted."
+                    )
+
+            except Exception as error:
+
+                predicted_leaf = None
+
+                st.error(
+                    f"ToC prediction error: {error}"
+                )
+
 
         # ------------------------------------------
-        # Hybrid retrieval
+        # B. HYBRID RETRIEVAL
         # ------------------------------------------
+
+        st.subheader("2. Retrieved Evidence")
 
         with st.spinner(
             "Searching document using hybrid retrieval..."
         ):
 
-            evidence = retrieve_evidence(
-                question=question,
-                text=text,
-                toc=toc,
-                predicted_leaf=predicted_leaf,
-                top_k=top_k
-            )
+            try:
 
-        st.subheader("2. Retrieved Evidence")
+                evidence = retrieve_evidence(
+                    question=question,
+                    text=text,
+                    toc=toc,
+                    predicted_leaf=predicted_leaf,
+                    top_k=top_k
+                )
 
-        if not evidence:
+            except Exception as error:
 
-            st.warning(
-                "No evidence found. Check PDF extraction "
-                "and section detection."
-            )
+                evidence = []
 
-        else:
+                st.error(
+                    f"Retrieval error: {error}"
+                )
 
-            for index, item in enumerate(evidence, start=1):
+
+        # ------------------------------------------
+        # C. DISPLAY RETRIEVED CHUNKS
+        # ------------------------------------------
+
+        if evidence:
+
+            for index, item in enumerate(
+                evidence,
+                start=1
+            ):
+
+                title = item.get(
+                    "title",
+                    "Unknown Section"
+                )
+
+                score = item.get(
+                    "score",
+                    0.0
+                )
+
+                page = item.get("page")
 
                 with st.expander(
-                    f"Evidence {index}: {item['title']} "
-                    f"(Score: {item['score']:.4f})",
+                    f"Evidence {index}: {title} | Score: {score:.4f}",
                     expanded=(index == 1)
                 ):
 
@@ -255,55 +383,71 @@ if st.button(
                         item.get("source", "Unknown")
                     )
 
-                    page = item.get("page")
-
                     st.write(
                         "**PDF Page:**",
-                        page if page else "Not available"
+                        page if page is not None else "Unavailable"
                     )
 
-                    st.write("**Retrieved Text:**")
+                    st.markdown("**Retrieved Text:**")
 
                     st.text(
-                        item["text"][:5000]
+                        item.get("text", "")[:5000]
                     )
 
+        else:
+
+            st.error(
+                "No relevant evidence was retrieved. "
+                "Check document extraction and retrieval."
+            )
+
+
         # ------------------------------------------
-        # Generate answer
+        # D. GENERATE FINAL ANSWER
         # ------------------------------------------
 
         st.subheader("3. Generated Answer")
 
         if evidence:
 
-            with st.spinner(
-                "Generating evidence-based answer..."
-            ):
+            if not api_key:
 
-                try:
+                st.error(
+                    "OPENROUTER_API_KEY is missing. "
+                    "Add it in Streamlit Cloud Secrets."
+                )
 
-                    answer = answer_with_openrouter(
-                        question,
-                        evidence
-                    )
+            else:
 
-                    st.success(answer)
+                with st.spinner(
+                    "Generating answer using OpenRouter..."
+                ):
 
-                except Exception as e:
+                    try:
 
-                    st.error(
-                        f"Answer generation failed: {e}"
-                    )
+                        answer = answer_with_openrouter(
+                            question,
+                            evidence
+                        )
+
+                        st.markdown(answer)
+
+                    except Exception as error:
+
+                        st.error(
+                            f"Answer generation failed: {error}"
+                        )
 
         else:
 
             st.warning(
                 "Answer generation skipped because "
-                "no evidence was retrieved."
+                "no relevant evidence was retrieved."
             )
 
+
         # ------------------------------------------
-        # Retrieval debugging
+        # E. RETRIEVAL DIAGNOSTICS
         # ------------------------------------------
 
         st.subheader("4. Retrieval Diagnostics")
@@ -312,40 +456,51 @@ if st.button(
 
             best = evidence[0]
 
-            st.write(
-                "**Best matching section:**",
-                best["title"]
+            col1, col2 = st.columns(2)
+
+            col1.metric(
+                "Best Matching Score",
+                f"{best.get('score', 0):.4f}"
+            )
+
+            col2.metric(
+                "Retrieved Chunks",
+                len(evidence)
             )
 
             st.write(
-                "**Best matching score:**",
-                round(best["score"], 4)
+                "**Best Matching Section:**",
+                best.get("title", "Unknown")
             )
 
             st.write(
-                "**Best matching page:**",
+                "**Best Matching PDF Page:**",
                 best.get("page") or "Unavailable"
             )
 
-            if best.get("page") == "5":
-                st.info(
-                    "Check whether this page contains "
-                    "the expected environmental expenditure."
-                )
 
-        st.caption(
-            "Answers are generated only from retrieved evidence. "
-            "Always verify important financial figures "
-            "against the original report."
-        )
+# ==================================================
+# 11. SIDEBAR DOCUMENT MANAGEMENT
+# ==================================================
 
-# --------------------------------------------------
-# 9. Footer
-# --------------------------------------------------
+st.sidebar.divider()
+
+st.sidebar.subheader("Document Management")
+
+if st.sidebar.button("Clear Uploaded Documents"):
+
+    st.session_state.documents = {}
+
+    st.rerun()
+
+
+# ==================================================
+# 12. FOOTER
+# ==================================================
 
 st.divider()
 
 st.caption(
-    "Finance STAIR-RAG | Evidence-based financial "
-    "document question answering"
+    "Finance STAIR-RAG | Structure-Aware Financial "
+    "Document Question Answering"
 )
