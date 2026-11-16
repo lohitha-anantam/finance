@@ -1,11 +1,11 @@
 
 """
 Finance STAIR Core
-- Predicts a relevant leaf section using a trained LoRA adapter.
-- Uses an embedding baseline if the adapter is unavailable.
-- Retrieves evidence from the predicted section first.
-- Performs global retrieval as a fallback.
-- Generates answers using only retrieved evidence.
+
+1. Predict relevant ToC section.
+2. Retrieve evidence from the predicted section.
+3. Search other sections when necessary.
+4. Generate answers using OpenRouter.
 """
 
 import os
@@ -20,34 +20,33 @@ from toc_generator import attach_sections, toc_text
 
 
 BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
+
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
-# ---------------------------------------------------------
-# 1. ToC utilities
-# ---------------------------------------------------------
+# --------------------------------------------------
+# 1. Flatten Table of Contents
+# --------------------------------------------------
 
 def flatten_toc(toc):
-    """
-    Convert a nested or flat ToC into a list of leaf section titles.
 
-    Supports common structures:
-    {"title": "...", "children": [...]}
-    {"title": "...", "subsections": [...]}
-    {"title": "...", "sections": [...]}
-    """
-
-    leaves = []
+    output = []
 
     def visit(node):
+
         if isinstance(node, str):
-            leaves.append(node.strip())
+
+            if node.strip():
+                output.append(node.strip())
+
             return
 
         if not isinstance(node, dict):
             return
 
-        title = str(node.get("title", "")).strip()
+        title = str(
+            node.get("title", "")
+        ).strip()
 
         children = (
             node.get("children")
@@ -57,116 +56,113 @@ def flatten_toc(toc):
         )
 
         if children:
+
             for child in children:
                 visit(child)
+
         elif title:
-            leaves.append(title)
 
-    for item in toc or []:
-        visit(item)
+            output.append(title)
 
-    # Remove duplicate titles while preserving order
+    for node in toc or []:
+        visit(node)
+
     result = []
     seen = set()
 
-    for title in leaves:
+    for title in output:
+
         key = title.lower()
 
-        if title and key not in seen:
+        if key not in seen:
             seen.add(key)
             result.append(title)
 
     return result
 
 
-def format_toc_for_prompt(toc):
-    """
-    Keep this format identical in train_stair.py
-    and generate_training_data.py.
-    """
+# --------------------------------------------------
+# 2. Build STAIR Prompt
+# --------------------------------------------------
+
+def build_stair_prompt(question, toc):
 
     titles = flatten_toc(toc)
 
-    return "\n".join(f"- {title}" for title in titles)
-
-
-def build_stair_prompt(question, toc):
-    """
-    Exact inference prompt used by the training script.
-    """
+    formatted_toc = "\n".join(
+        f"- {title}"
+        for title in titles
+    )
 
     return (
         "You are a structure-aware financial document retriever.\n"
-        "Given a financial question and the document table of contents, "
-        "select the single most relevant leaf section.\n"
-        "Output ONLY one exact section title from the supplied ToC.\n\n"
-        f"TABLE OF CONTENTS:\n{format_toc_for_prompt(toc)}\n\n"
+        "Choose the single most relevant section title "
+        "from the supplied list.\n"
+        "Return exactly one title copied from the list. "
+        "Do not return a sentence from the report.\n\n"
+        f"TABLE OF CONTENTS:\n{formatted_toc}\n\n"
         f"QUESTION: {question}\n"
         "SECTION:"
     )
 
 
-# ---------------------------------------------------------
-# 2. Embedding model
-# ---------------------------------------------------------
+# --------------------------------------------------
+# 3. Load Embedding Model
+# --------------------------------------------------
 
 @lru_cache(maxsize=1)
 def load_embedder():
-    return SentenceTransformer(EMBED_MODEL)
+
+    return SentenceTransformer(
+        EMBED_MODEL
+    )
 
 
-# ---------------------------------------------------------
-# 3. Load trained STAIR model
-# ---------------------------------------------------------
+# --------------------------------------------------
+# 4. Load Trained LoRA Model
+# --------------------------------------------------
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=1)
 def load_stair_model(adapter_path):
-    """
-    Load the base Mistral model and its trained LoRA adapter.
-    Cached so Streamlit does not reload the model for every question.
-    """
 
     import torch
+
     from transformers import (
         AutoTokenizer,
         AutoModelForCausalLM,
         BitsAndBytesConfig
     )
+
     from peft import PeftModel
 
     adapter = Path(adapter_path)
 
-    if not adapter.exists():
+    if not (
+        adapter / "adapter_config.json"
+    ).exists():
+
         raise FileNotFoundError(
-            f"LoRA adapter not found: {adapter_path}"
+            "Trained STAIR adapter not found."
         )
 
-    if not (adapter / "adapter_config.json").exists():
-        raise FileNotFoundError(
-            "The adapter folder does not contain adapter_config.json. "
-            "Train the model first."
-        )
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        BASE_MODEL,
-        use_fast=True
-    )
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    quant_config = BitsAndBytesConfig(
+    quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True
     )
 
+    tokenizer = AutoTokenizer.from_pretrained(
+        BASE_MODEL
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     base_model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL,
-        quantization_config=quant_config,
-        device_map="auto",
-        torch_dtype=torch.float16
+        quantization_config=quantization_config,
+        device_map="auto"
     )
 
     model = PeftModel.from_pretrained(
@@ -179,9 +175,9 @@ def load_stair_model(adapter_path):
     return tokenizer, model
 
 
-# ---------------------------------------------------------
-# 4. Predict relevant ToC leaf
-# ---------------------------------------------------------
+# --------------------------------------------------
+# 5. Predict Relevant Section
+# --------------------------------------------------
 
 def predict_leaf(question, toc, adapter_path=None):
 
@@ -190,17 +186,26 @@ def predict_leaf(question, toc, adapter_path=None):
     if not candidates:
         return None
 
-    # Use trained LoRA adapter if available
-    if adapter_path and Path(adapter_path).exists():
+    # Use trained STAIR adapter
+    if (
+        adapter_path
+        and (
+            Path(adapter_path) / "adapter_config.json"
+        ).exists()
+    ):
 
         try:
+
             import torch
 
             tokenizer, model = load_stair_model(
                 str(adapter_path)
             )
 
-            prompt = build_stair_prompt(question, toc)
+            prompt = build_stair_prompt(
+                question,
+                toc
+            )
 
             inputs = tokenizer(
                 prompt,
@@ -214,190 +219,246 @@ def predict_leaf(question, toc, adapter_path=None):
                 for key, value in inputs.items()
             }
 
-            with torch.no_grad():
+            with torch.inference_mode():
+
                 output = model.generate(
                     **inputs,
-                    max_new_tokens=64,
+                    max_new_tokens=48,
                     do_sample=False,
                     pad_token_id=tokenizer.eos_token_id
                 )
 
-            generated = output[
-                0, inputs["input_ids"].shape[1]:
-            ]
-
-            raw = tokenizer.decode(
-                generated,
+            generated = tokenizer.decode(
+                output[0, inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True
             ).strip()
 
-            # Accept only an actual ToC leaf title
-            raw_normalized = re.sub(
+            normalized = re.sub(
                 r"\s+",
                 " ",
-                raw.lower()
-            )
+                generated
+            ).strip().lower()
 
+            # Only accept an exact ToC title
             for candidate in candidates:
-                candidate_normalized = re.sub(
+
+                expected = re.sub(
                     r"\s+",
                     " ",
-                    candidate.lower()
-                )
+                    candidate
+                ).strip().lower()
 
-                if (
-                    raw_normalized == candidate_normalized
-                    or candidate_normalized in raw_normalized
-                ):
+                if normalized == expected:
+
                     return candidate
 
             print(
-                "Model output did not match an exact ToC title:",
-                raw
+                "Generated title does not match ToC:",
+                generated
             )
 
         except Exception as error:
+
             print(
-                "Trained adapter unavailable. "
-                "Using embedding baseline:",
+                "STAIR adapter failed. "
+                "Using embedding fallback:",
                 error
             )
 
-    # Fallback: embedding-based section ranking
-    # This is NOT the trained STAIR model.
-    try:
-        embedder = load_embedder()
+    # Embedding fallback
+    # This is not the trained STAIR model.
 
-        question_embedding = embedder.encode(
-            [question],
-            normalize_embeddings=True
-        )
+    embedder = load_embedder()
 
-        candidate_embeddings = embedder.encode(
-            candidates,
-            normalize_embeddings=True
-        )
+    question_embedding = embedder.encode(
+        [question],
+        normalize_embeddings=True
+    )
 
-        scores = candidate_embeddings @ question_embedding[0]
+    candidate_embeddings = embedder.encode(
+        candidates,
+        normalize_embeddings=True
+    )
 
-        return candidates[int(np.argmax(scores))]
+    scores = (
+        candidate_embeddings
+        @ question_embedding[0]
+    )
 
-    except Exception as error:
-        print("Embedding prediction failed:", error)
-        return candidates[0]
+    return candidates[
+        int(np.argmax(scores))
+    ]
 
 
-# ---------------------------------------------------------
-# 5. Financial metric matching
-# ---------------------------------------------------------
+# --------------------------------------------------
+# 6. Financial Metric Matching
+# --------------------------------------------------
 
 def metric_terms(question):
-    """
-    Extract important financial concepts from a question.
-    This helps distinguish similar financial metrics.
-    """
 
     q = question.lower()
 
-    groups = {
+    categories = {
+
         "revenue": [
             "revenue",
             "turnover",
             "sales",
             "income from operations"
         ],
+
         "profit": [
             "profit",
             "net profit",
             "pat",
             "profit after tax"
         ],
-        "operating_profit": [
+
+        "ebitda": [
             "ebitda",
-            "operating profit",
-            "operating margin"
+            "operating profit"
         ],
+
         "assets": [
             "total assets",
             "assets"
         ],
+
         "debt": [
             "debt",
             "borrowings",
             "loans"
         ],
+
         "cash_flow": [
             "cash flow",
-            "operating cash flow",
             "cash generated"
         ],
+
         "dividend": [
-            "dividend",
-            "dividend per share"
+            "dividend"
         ],
+
         "employees": [
             "employees",
-            "workforce",
-            "employee count"
+            "workforce"
         ]
     }
 
     matched = []
 
-    for category, terms in groups.items():
-        if any(term in q for term in terms):
+    for category, words in categories.items():
+
+        if any(word in q for word in words):
+
             matched.append(category)
 
     return matched
 
 
 def financial_metric_bonus(question, text):
-    """
-    Small relevance adjustment for financial terminology.
-    """
 
     terms = metric_terms(question)
 
-    if not terms:
-        return 0.0
-
     content = text.lower()
-    bonus = 0.0
 
-    keyword_map = {
+    keywords = {
+
         "revenue": [
             "revenue",
             "turnover",
             "sales",
             "income from operations"
         ],
+
         "profit": [
             "profit",
             "pat",
             "profit after tax"
         ],
-        "operating_profit": [
+
+        "ebitda": [
             "ebitda",
-            "operating profit",
-            "operating margin"
+            "operating profit"
         ],
-        "assets": ["total assets", "assets"],
-        "debt": ["debt", "borrowings", "loans"],
-        "cash_flow": ["cash flow", "cash generated"],
-        "dividend": ["dividend"],
-        "employees": ["employees", "workforce"]
+
+        "assets": [
+            "assets"
+        ],
+
+        "debt": [
+            "debt",
+            "borrowings"
+        ],
+
+        "cash_flow": [
+            "cash flow"
+        ],
+
+        "dividend": [
+            "dividend"
+        ],
+
+        "employees": [
+            "employees",
+            "workforce"
+        ]
     }
 
+    bonus = 0.0
+
     for category in terms:
-        if any(word in content for word in keyword_map[category]):
+
+        if any(
+            word in content
+            for word in keywords[category]
+        ):
+
             bonus += 0.025
 
     return min(bonus, 0.10)
 
 
-# ---------------------------------------------------------
-# 6. Evidence retrieval
-# ---------------------------------------------------------
+# --------------------------------------------------
+# 7. PDF Page Chunk Extraction
+# --------------------------------------------------
+
+def create_page_chunks(text):
+
+    pattern = r"\[PAGE\s+(\d+)\]"
+
+    pages = re.split(pattern, text)
+
+    chunks = []
+
+    for i in range(1, len(pages), 2):
+
+        page_number = int(pages[i])
+
+        page_text = pages[i + 1].strip()
+
+        if page_text:
+
+            chunks.append({
+
+                "title": f"PDF Page {page_number}",
+
+                "text": page_text,
+
+                "page": page_number,
+
+                "start_line": None,
+
+                "end_line": None
+
+            })
+
+    return chunks
+
+
+# --------------------------------------------------
+# 8. Evidence Retrieval
+# --------------------------------------------------
 
 def retrieve_evidence(
     question,
@@ -406,61 +467,90 @@ def retrieve_evidence(
     predicted_leaf=None,
     top_k=5
 ):
-    """
-    Retrieve evidence from the predicted section first.
 
-    Also searches the remaining sections and PDF page chunks.
-    This avoids losing the answer when the predicted section is wrong.
-    """
+    # Extract structured sections
 
-    sections = attach_sections(text, toc)
+    sections = attach_sections(
+        text,
+        toc
+    )
 
-    candidates = []
+    candidates = [
 
-    # Add structured sections
-    for section in sections:
+        dict(section)
 
-        if not isinstance(section, dict):
-            continue
+        for section in sections
 
-        section_text = str(section.get("text", "")).strip()
+        if section.get("text", "").strip()
 
-        if not section_text:
-            continue
+    ]
 
-        item = dict(section)
+    # Add page chunks
 
-        item["title"] = str(
-            section.get("title", "Untitled section")
-        )
+    page_chunks = create_page_chunks(text)
 
-        item["text"] = section_text
+    candidates.extend(page_chunks)
 
-        candidates.append(item)
-
-    # Add page-based chunks for fallback retrieval
-    page_pattern = r"\[PAGE\s+(\d+)\]"
-
-    pages = re.split(page_pattern, text)
-
-    for i in range(1, len(pages), 2):
-
-        page_number = pages[i]
-        page_text = pages[i + 1].strip()
-
-        if not page_text:
-            continue
-
-        candidates.append({
-            "title": f"PDF Page {page_number}",
-            "text": page_text,
-            "page": int(page_number),
-            "start_line": None,
-            "end_line": None
-        })
+    # Fallback when no sections or page markers exist
 
     if not candidates:
+
+        lines = text.splitlines()
+
+        chunk_size = 45
+
+        overlap = 8
+
+        step = chunk_size - overlap
+
+        for start in range(
+            0,
+            len(lines),
+            step
+        ):
+
+            end = min(
+                start + chunk_size,
+                len(lines)
+            )
+
+            content = "\n".join(
+                lines[start:end]
+            ).strip()
+
+            if len(content) >= 100:
+
+                candidates.append({
+
+                    "title": (
+                        f"Extracted lines {start + 1}-{end}"
+                    ),
+
+                    "text": content,
+
+                    "start_line": start + 1,
+
+                    "end_line": end
+
+                })
+
+    if not candidates:
+
+        print("No retrieval candidates found.")
+
         return []
+
+    print(
+        "DEBUG: Total retrieval candidates:",
+        len(candidates)
+    )
+
+    print(
+        "DEBUG: Predicted section:",
+        predicted_leaf
+    )
+
+    # Generate embeddings
 
     embedder = load_embedder()
 
@@ -470,8 +560,11 @@ def retrieve_evidence(
     )
 
     document_texts = [
-        item["title"] + "\n" + item["text"][:7000]
+
+        item["title"] + "\n" + item["text"][:6000]
+
         for item in candidates
+
     ]
 
     document_embeddings = embedder.encode(
@@ -479,33 +572,29 @@ def retrieve_evidence(
         normalize_embeddings=True
     )
 
-    scores = document_embeddings @ question_embedding[0]
+    scores = (
+        document_embeddings
+        @ question_embedding[0]
+    )
 
-    predicted_normalized = (
-        re.sub(r"\s+", " ", predicted_leaf.lower()).strip()
+    # Give a small preference to predicted section
+
+    target = (
+        predicted_leaf.lower().strip()
         if predicted_leaf
         else None
     )
 
-    # Score adjustment
-    for index, item in enumerate(candidates):
+    for i, item in enumerate(candidates):
 
-        score = float(scores[index])
+        score = float(scores[i])
 
-        title_normalized = re.sub(
-            r"\s+",
-            " ",
-            item["title"].lower()
-        ).strip()
+        title = item["title"].lower().strip()
 
-        # Prioritize the predicted leaf section
-        if (
-            predicted_normalized
-            and title_normalized == predicted_normalized
-        ):
-            score += 0.12
+        if target and title == target:
 
-        # Add small bonus for matching financial metrics
+            score += 0.08
+
         score += financial_metric_bonus(
             question,
             item["title"] + "\n" + item["text"][:5000]
@@ -513,28 +602,40 @@ def retrieve_evidence(
 
         item["score"] = score
 
-    # Sort by final relevance score
+    # Sort by relevance
+
     candidates.sort(
         key=lambda item: item["score"],
         reverse=True
     )
 
-    return candidates[:top_k]
+    return candidates[:max(1, top_k)]
 
 
-# ---------------------------------------------------------
-# 7. Evidence-based answer generation
-# ---------------------------------------------------------
+# --------------------------------------------------
+# 9. OpenRouter Answer Generation
+# --------------------------------------------------
 
 def answer_with_openrouter(question, evidence):
 
     import requests
 
-    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    api_key = os.getenv(
+        "OPENROUTER_API_KEY",
+        ""
+    )
 
     if not api_key:
+
         raise RuntimeError(
             "Add OPENROUTER_API_KEY to Streamlit Secrets."
+        )
+
+    if not evidence:
+
+        return (
+            "No evidence was retrieved. "
+            "Check document extraction and retrieval."
         )
 
     model = os.getenv(
@@ -542,76 +643,101 @@ def answer_with_openrouter(question, evidence):
         "openai/gpt-4o-mini"
     )
 
-    if not evidence:
-        return "No supporting evidence was retrieved."
-
-    context_parts = []
+    context = []
 
     for item in evidence:
 
-        title = item.get("title", "Unknown section")
-        content = item.get("text", "")
+        title = item.get(
+            "title",
+            "Unknown section"
+        )
 
         page = item.get("page")
 
         source = (
             f"PDF page {page}"
-            if page is not None
-            else "Page number unavailable"
+            if page
+            else title
         )
 
-        context_parts.append(
-            f"SECTION: {title}\n"
+        content = item.get(
+            "text",
+            ""
+        )
+
+        context.append(
+
             f"SOURCE: {source}\n"
-            f"EVIDENCE:\n{content[:5000]}"
-        )
+            f"SECTION: {title}\n"
+            f"EVIDENCE:\n{content[:4500]}"
 
-    context = "\n\n".join(context_parts)
+        )
 
     system_prompt = """
 You are a financial annual-report analysis assistant.
 
-Rules:
-1. Answer only using the supplied evidence.
-2. Never invent financial figures, percentages, dates or facts.
-3. Distinguish consolidated figures from standalone figures.
-4. Distinguish revenue, turnover, total income, profit and cash flow.
-5. Pay attention to the financial year asked in the question.
-6. Do not treat similarly named financial metrics as identical.
-7. If the evidence does not contain the answer, clearly say:
-   "The retrieved evidence does not provide enough information."
-8. Include the relevant section title and PDF page number when available.
-9. If multiple figures appear, explain which figure answers the question
-   and why.
+Follow these rules:
+
+1. Answer only from the supplied evidence.
+2. Never invent financial figures.
+3. Distinguish consolidated and standalone figures.
+4. Distinguish turnover, revenue and total income.
+5. Distinguish profit and cash flow.
+6. Pay attention to the financial year.
+7. If evidence is insufficient, say so.
+8. Cite the section title and PDF page when available.
+9. If multiple figures appear, explain which one answers
+   the question and why.
 """
 
     payload = {
+
         "model": model,
-        "temperature": 0.0,
+
+        "temperature": 0,
+
         "messages": [
+
             {
                 "role": "system",
                 "content": system_prompt
             },
+
             {
                 "role": "user",
+
                 "content": (
+
                     f"QUESTION:\n{question}\n\n"
-                    f"RETRIEVED EVIDENCE:\n{context}\n\n"
-                    "Provide an accurate answer with its source."
+
+                    "RETRIEVED EVIDENCE:\n"
+
+                    + "\n\n---\n\n".join(context)
+
                 )
+
             }
+
         ]
+
     }
 
     response = requests.post(
+
         "https://openrouter.ai/api/v1/chat/completions",
+
         headers={
+
             "Authorization": f"Bearer {api_key}",
+
             "Content-Type": "application/json"
+
         },
+
         json=payload,
+
         timeout=120
+
     )
 
     response.raise_for_status()
