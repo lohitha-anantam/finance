@@ -1,209 +1,306 @@
-
-"""
-Finance STAIR - Table of Contents Generator
-
-Functions:
-1. Detect section headings.
-2. Build a Table of Contents.
-3. Divide the report into sections.
-4. Preserve available PDF page markers.
-"""
-
 import re
+from collections import Counter
 
-PAGE_RE = re.compile(r"\[PAGE\s+(\d+)\]", re.IGNORECASE)
+PAGE_RE = re.compile(
+    r"\[PAGE\s+(\d+)\]",
+    re.I
+)
+
+NUM_RE = re.compile(
+    r"^(\d+(?:\.\d+){0,5})[.)]?\s+(.+?)\s*$"
+)
+
+APPENDIX_RE = re.compile(
+    r"^(Appendix\s+[A-Z0-9]+[:.\-]?\s*.+)$",
+    re.I
+)
 
 
-def clean_heading(line):
-    return re.sub(r"\s+", " ", line).strip(" \t:-–—|")
+def clean_line(text):
+    return re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip(" \t|")
 
 
-def is_heading(line):
-    line = clean_heading(line)
+def heading_level(line):
+    """
+    Estimate heading level using numbering,
+    capitalization and title formatting.
+    """
+    text = clean_line(line)
 
-    if not line:
-        return False
+    if (
+        not text
+        or len(text) > 150
+        or len(text.split()) > 18
+        or re.search(r"[.!?]$", text)
+    ):
+        return None
 
-    if len(line) < 3 or len(line) > 120:
-        return False
+    match = NUM_RE.match(text)
 
-    words = line.split()
+    if match:
+        return min(
+            match.group(1).count(".") + 1,
+            6
+        )
 
-    if len(words) > 14:
-        return False
+    if APPENDIX_RE.match(text):
+        return 1
 
-    # Avoid normal sentences.
-    if re.search(r"[.!?;]$", line):
-        return False
-
-    # Numbered headings such as 1, 1.1, 2.3.4
-    numbered = re.match(
-        r"^(?:\d+(?:\.\d+){0,4}|[A-Z])[\).]?\s+\S",
-        line
-    )
-
-    letters = re.sub(r"[^A-Za-z]", "", line)
+    letters = [
+        char for char in text
+        if char.isalpha()
+    ]
 
     if not letters:
-        return False
+        return None
 
-    uppercase_ratio = (
-        sum(char.isupper() for char in letters) / len(letters)
+    upper_ratio = (
+        sum(char.isupper() for char in letters)
+        / len(letters)
     )
 
-    title_case_count = sum(
-        word[0].isupper()
-        for word in words
-        if word[0].isalpha()
-    )
+    if upper_ratio >= 0.82 and 2 <= len(text.split()) <= 14:
+        return 1
 
-    title_ratio = title_case_count / max(1, len(words))
+    words = text.split()
 
-    return bool(
-        numbered
-        or uppercase_ratio > 0.78
-        or (
-            title_ratio > 0.75
-            and len(words) <= 10
+    title_ratio = (
+        sum(
+            word[0].isupper()
+            for word in words
+            if word[0].isalpha()
         )
+        / max(1, len(words))
     )
 
+    if (
+        title_ratio >= 0.8
+        and len(words) <= 10
+        and len(text) <= 90
+    ):
+        return 2
 
-def build_toc(text, max_headings=250):
+    return None
 
-    headings = []
+
+def build_toc(text, max_headings=500):
+    """
+    Build a nested Table of Contents.
+    Review the generated hierarchy for each report.
+    """
+    roots = []
+    stack = []
     seen = set()
 
-    for line in text.splitlines():
+    for raw_line in text.splitlines():
+        line = clean_line(raw_line)
+        level = heading_level(line)
 
-        heading = clean_heading(line)
+        if not level:
+            continue
 
-        if is_heading(heading):
+        key = line.casefold()
 
-            key = heading.lower()
+        if key in seen:
+            continue
 
-            if key not in seen:
+        seen.add(key)
 
-                seen.add(key)
+        node = {
+            "title": line,
+            "level": level,
+            "children": []
+        }
 
-                headings.append({
-                    "title": heading,
+        while (
+            stack
+            and stack[-1]["level"] >= level
+        ):
+            stack.pop()
+
+        if stack:
+            stack[-1]["children"].append(node)
+        else:
+            roots.append(node)
+
+        stack.append(node)
+
+        if len(seen) >= max_headings:
+            break
+
+    return roots
+
+
+def flatten_nodes(toc):
+    result = []
+
+    def walk(nodes, parent=""):
+        for node in nodes or []:
+
+            if isinstance(node, str):
+                path = (
+                    f"{parent} > {node}"
+                    if parent else node
+                )
+
+                result.append({
+                    "title": node,
+                    "path": path,
                     "level": 1
                 })
 
-            if len(headings) >= max_headings:
-                break
+                continue
 
-    return headings
+            title = clean_line(
+                str(node.get("title", ""))
+            )
+
+            path = (
+                f"{parent} > {title}"
+                if parent else title
+            )
+
+            children = node.get("children", [])
+
+            result.append({
+                "title": title,
+                "path": path,
+                "level": node.get("level", 1),
+                "is_leaf": not bool(children)
+            })
+
+            walk(children, path)
+
+    walk(toc)
+
+    return result
 
 
-def get_heading_title(item):
+def leaf_nodes(toc):
+    return [
+        node
+        for node in flatten_nodes(toc)
+        if node.get("is_leaf") and node["title"]
+    ]
 
-    if isinstance(item, str):
-        return item.strip()
 
-    if isinstance(item, dict):
-        return str(item.get("title", "")).strip()
+def toc_text(toc):
+    lines = []
 
-    return ""
+    for node in flatten_nodes(toc):
+        indentation = (
+            "  " * (
+                int(node.get("level", 1)) - 1
+            )
+        )
+
+        lines.append(
+            indentation + node["title"]
+        )
+
+    return "\n".join(lines)
 
 
 def attach_sections(text, toc):
     """
-    Divide the report into sections using detected headings.
-
-    Returns:
-        title
-        text
-        page_start
-        page_end
-        start_line
-        end_line
+    Match headings with their corresponding content.
+    Preserve PDF page references.
     """
+    flat = flatten_nodes(toc)
+
+    by_title = {}
+
+    for node in flat:
+        key = clean_line(
+            node["title"]
+        ).casefold()
+
+        by_title.setdefault(
+            key, []
+        ).append(node)
 
     lines = text.splitlines()
 
-    heading_lookup = {}
-
-    for item in toc:
-
-        title = get_heading_title(item)
-
-        if title:
-
-            key = re.sub(
-                r"\s+",
-                " ",
-                title
-            ).strip().lower()
-
-            heading_lookup[key] = title
-
-    starts = []
+    heading_hits = []
     current_page = None
 
-    for index, line in enumerate(lines):
+    for index, raw_line in enumerate(lines):
 
-        page_match = PAGE_RE.search(line)
+        page_match = PAGE_RE.search(raw_line)
 
         if page_match:
-            current_page = int(page_match.group(1))
+            current_page = int(
+                page_match.group(1)
+            )
 
-        cleaned = clean_heading(line)
+        key = clean_line(
+            raw_line
+        ).casefold()
 
-        key = re.sub(
-            r"\s+",
-            " ",
-            cleaned
-        ).strip().lower()
-
-        if key in heading_lookup:
-
-            starts.append({
+        if key in by_title:
+            heading_hits.append({
                 "line": index,
-                "title": heading_lookup[key],
+                "nodes": by_title[key],
                 "page": current_page
             })
 
     sections = []
+    used = Counter()
 
-    for i, item in enumerate(starts):
+    for index, hit in enumerate(heading_hits):
 
-        start = item["line"]
+        options = hit["nodes"]
 
-        if i + 1 < len(starts):
-            end = starts[i + 1]["line"]
-        else:
-            end = len(lines)
+        key = clean_line(
+            lines[hit["line"]]
+        ).casefold()
 
-        section_text = "\n".join(
-            lines[start + 1:end]
+        selected = options[
+            min(
+                used[key],
+                len(options) - 1
+            )
+        ]
+
+        used[key] += 1
+
+        end_line = (
+            heading_hits[index + 1]["line"]
+            if index + 1 < len(heading_hits)
+            else len(lines)
+        )
+
+        body = "\n".join(
+            lines[hit["line"] + 1:end_line]
         ).strip()
 
-        if len(section_text) < 80:
+        if len(body) < 40:
             continue
 
+        end_page = hit["page"]
+
+        for line in lines[
+            hit["line"] + 1:end_line
+        ]:
+            page_match = PAGE_RE.search(line)
+
+            if page_match:
+                end_page = int(
+                    page_match.group(1)
+                )
+
         sections.append({
-            "title": item["title"],
-            "text": section_text,
-            "page_start": item["page"],
-            "page_end": None,
-            "start_line": start + 1,
-            "end_line": end
+            "title": selected["title"],
+            "path": selected["path"],
+            "text": body,
+            "page_start": hit["page"],
+            "page_end": end_page,
+            "start_line": hit["line"] + 1,
+            "end_line": end_line
         })
 
     return sections
-
-
-def toc_text(toc):
-
-    output = []
-
-    for item in toc:
-
-        title = get_heading_title(item)
-
-        if title:
-            output.append(f"- {title}")
-
-    return "\n".join(output)
