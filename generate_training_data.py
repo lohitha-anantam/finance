@@ -1,569 +1,223 @@
-
-"""
-Finance STAIR - Training Data Generator
-
-Input:
-    data/structured.jsonl
-
-Output:
-    data/stair_train.jsonl
-
-Generates:
-    question
-    answer
-    gold_leaf
-    doc_id
-    toc
-"""
-
 import os
-import re
 import json
+import time
 import argparse
-import requests
-
 from pathlib import Path
-from dotenv import load_dotenv
 
-load_dotenv()
+from openai import OpenAI
 
-from config import OPENROUTER_API_KEY, OPENROUTER_MODEL
-
-
-# --------------------------------------------------
-# 1. Flatten Table of Contents
-# --------------------------------------------------
-
-def flatten_toc(toc):
-
-    output = []
-
-    def visit(node):
-
-        if isinstance(node, str):
-
-            if node.strip():
-                output.append(node.strip())
-
-            return
-
-        if not isinstance(node, dict):
-            return
-
-        title = str(
-            node.get("title", "")
-        ).strip()
-
-        children = (
-            node.get("children")
-            or node.get("subsections")
-            or node.get("sections")
-            or []
-        )
-
-        if children:
-
-            for child in children:
-                visit(child)
-
-        elif title:
-
-            output.append(title)
-
-    for item in toc or []:
-        visit(item)
-
-    # Remove duplicate headings
-
-    result = []
-    seen = set()
-
-    for title in output:
-
-        key = title.lower()
-
-        if key not in seen:
-
-            seen.add(key)
-            result.append(title)
-
-    return result
-
-
-# --------------------------------------------------
-# 2. OpenRouter System Prompt
-# --------------------------------------------------
 
 SYSTEM_PROMPT = """
-You generate high-quality training questions for a
-financial annual-report retrieval system.
+You are a financial document question-generation assistant.
 
-Use ONLY the supplied section text.
-
-Generate exactly TWO different questions.
-
-Questions should cover useful financial information such as:
-
-- Revenue and turnover
-- Profit and loss
-- EBITDA
-- Total assets
-- Debt and borrowings
-- Cash flow
-- Dividends
-- Employee information
-- Business performance
-- Risks and strategies
-- Financial year information
+Generate questions that can be answered using ONLY the supplied section.
 
 Rules:
+1. Generate clear and realistic financial questions.
+2. Include numerical, factual and analytical questions.
+3. Do not invent information.
+4. Do not use information outside the supplied section.
+5. Questions must identify the subject clearly.
+6. Return valid JSON only.
 
-1. Questions must be natural and realistic.
-2. Questions must be answerable from the supplied section.
-3. Answers must be supported by the supplied text.
-4. Preserve exact financial figures and units.
-5. Include the financial year when available.
-6. Never invent numbers or facts.
-7. Do not ask questions that require other sections.
-
-Return ONLY a valid JSON array.
-
-Format:
-
-[
-  {
-    "question": "What was the reported revenue?",
-    "answer": "The reported revenue was ..."
-  }
-]
-
-Do not include Markdown.
-Do not include explanations.
+Required format:
+{
+  "questions": [
+    "What was the company's revenue?",
+    "What was its operating profit?"
+  ]
+}
 """
 
 
-# --------------------------------------------------
-# 3. Parse JSON Response
-# --------------------------------------------------
+def create_client():
+    api_key = os.getenv("OPENROUTER_API_KEY")
 
-def extract_json_array(content):
-
-    content = content.strip()
-
-    # Remove Markdown code fences
-
-    content = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        content,
-        flags=re.IGNORECASE
-    )
-
-    content = re.sub(
-        r"\s*```$",
-        "",
-        content
-    )
-
-    start = content.find("[")
-    end = content.rfind("]")
-
-    if start == -1 or end == -1:
-
+    if not api_key:
         raise ValueError(
-            "OpenRouter did not return a JSON array."
+            "Set OPENROUTER_API_KEY before running."
         )
 
-    return json.loads(
-        content[start:end + 1]
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1"
     )
 
 
-# --------------------------------------------------
-# 4. Generate Questions Using OpenRouter
-# --------------------------------------------------
+def generate_questions(
+    client,
+    section,
+    model,
+    count=5
+):
+    prompt = f"""
+Generate {count} questions using the following
+financial report section.
 
-def ask_openrouter(section_text, section_title):
+Section title:
+{section['title']}
 
-    if not OPENROUTER_API_KEY:
+Section path:
+{section['path']}
 
-        raise RuntimeError(
-            "Set OPENROUTER_API_KEY in your .env file."
-        )
+Section content:
+{section['text'][:12000]}
 
-    payload = {
+Return only JSON.
+"""
 
-        "model": OPENROUTER_MODEL,
-
-        "temperature": 0.2,
-
-        "messages": [
-
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0.2,
+        messages=[
             {
                 "role": "system",
                 "content": SYSTEM_PROMPT
             },
-
             {
                 "role": "user",
-
-                "content": (
-
-                    f"SECTION TITLE: {section_title}\n\n"
-
-                    f"SECTION TEXT:\n{section_text[:10000]}"
-
-                )
-
+                "content": prompt
             }
-
         ]
-
-    }
-
-    response = requests.post(
-
-        "https://openrouter.ai/api/v1/chat/completions",
-
-        headers={
-
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-
-            "Content-Type": "application/json"
-
-        },
-
-        json=payload,
-
-        timeout=120
-
     )
 
-    response.raise_for_status()
+    content = response.choices[0].message.content
 
-    content = response.json()["choices"][0]["message"]["content"]
+    # Remove optional Markdown JSON fences.
+    content = content.strip()
 
-    return extract_json_array(content)
+    if content.startswith("```"):
+        content = content.split("\n", 1)[1]
+        content = content.rsplit("```", 1)[0]
 
+    result = json.loads(content)
 
-# --------------------------------------------------
-# 5. Validate Generated Questions
-# --------------------------------------------------
+    questions = result.get("questions", [])
 
-def validate_examples(items, section_title):
-
-    valid = []
-
-    for item in items:
-
-        if not isinstance(item, dict):
-            continue
-
-        question = str(
-            item.get("question", "")
-        ).strip()
-
-        answer = str(
-            item.get("answer", "")
-        ).strip()
-
-        if len(question) < 10:
-            continue
-
-        if len(answer) < 3:
-            continue
-
-        valid.append({
-
-            "question": question,
-
-            "answer": answer,
-
-            "gold_leaf": section_title
-
-        })
-
-    return valid
+    return [
+        question.strip()
+        for question in questions
+        if isinstance(question, str)
+        and question.strip()
+    ]
 
 
-# --------------------------------------------------
-# 6. Normalize Questions
-# --------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser()
 
-def normalize_question(question):
-
-    return re.sub(
-        r"\s+",
-        " ",
-        question.strip().lower()
+    parser.add_argument(
+        "--input",
+        default="data/processed/corpus.jsonl"
     )
 
+    parser.add_argument(
+        "--output",
+        default="data/processed/stair_train.jsonl"
+    )
 
-# --------------------------------------------------
-# 7. Generate Training Dataset
-# --------------------------------------------------
+    parser.add_argument(
+        "--model",
+        default="openai/gpt-4o-mini"
+    )
 
-def main(
+    parser.add_argument(
+        "--questions-per-section",
+        type=int,
+        default=5
+    )
 
-    source="data/structured.jsonl",
+    args = parser.parse_args()
 
-    output="data/stair_train.jsonl",
+    input_path = Path(args.input)
+    output_path = Path(args.output)
 
-    limit=500
-
-):
-
-    source_path = Path(source)
-
-    output_path = Path(output)
-
-    if not source_path.exists():
-
+    if not input_path.exists():
         raise FileNotFoundError(
-            f"Input file not found: {source}"
+            f"Corpus not found: {input_path}"
         )
 
-    if limit <= 0:
-
-        raise ValueError(
-            "Training data limit must be greater than zero."
-        )
+    client = create_client()
 
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    count = 0
+    total_examples = 0
 
-    seen_questions = set()
-
-    with open(
-        source_path,
+    with input_path.open(
         "r",
         encoding="utf-8"
-    ) as input_file, open(
-        output_path,
+    ) as input_file, output_path.open(
         "w",
         encoding="utf-8"
     ) as output_file:
 
-        for line_number, line in enumerate(
-            input_file,
-            1
-        ):
+        for line in input_file:
 
-            if count >= limit:
-                break
-
-            try:
-
-                record = json.loads(line)
-
-            except json.JSONDecodeError:
-
-                print(
-                    f"Skipping invalid JSON line {line_number}"
-                )
-
+            if not line.strip():
                 continue
 
-            doc_id = record.get(
-                "doc_id",
-                f"document_{line_number}"
+            document = json.loads(line)
+
+            doc_id = document["doc_id"]
+
+            complete_toc = json.dumps(
+                document["toc"],
+                ensure_ascii=False
             )
 
-            sections = record.get(
-                "sections",
-                []
-            )
-
-            toc = record.get(
-                "toc",
-                []
-            )
-
-            leaf_titles = flatten_toc(toc)
-
-            if not leaf_titles:
-
-                print(
-                    f"Skipping {doc_id}: ToC is empty."
-                )
-
-                continue
-
-            # Use the complete list of ToC leaf titles.
-
-            training_toc = leaf_titles
-
-            for section in sections:
-
-                if count >= limit:
-                    break
-
-                title = str(
-                    section.get("title", "")
-                ).strip()
-
-                section_text = str(
-                    section.get("text", "")
-                ).strip()
-
-                if not title:
-                    continue
-
-                if len(section_text) < 100:
-                    continue
-
-                # Validate section title against ToC.
-
-                matched_title = next(
-
-                    (
-
-                        leaf
-
-                        for leaf in leaf_titles
-
-                        if leaf.lower() == title.lower()
-
-                    ),
-
-                    None
-
-                )
-
-                if matched_title is None:
-
-                    print(
-                        f"Skipping section not found in ToC: {title}"
-                    )
-
-                    continue
-
-                # Generate synthetic questions.
+            for section in document["sections"]:
 
                 try:
-
-                    generated = ask_openrouter(
-                        section_text,
-                        matched_title
+                    questions = generate_questions(
+                        client=client,
+                        section=section,
+                        model=args.model,
+                        count=args.questions_per_section
                     )
 
-                    examples = validate_examples(
-                        generated,
-                        matched_title
-                    )
+                    for question in questions:
 
-                except Exception as error:
+                        record = {
+                            "doc_id": doc_id,
+                            "question": question,
+                            "toc": complete_toc,
+                            "gold_leaf": section["path"],
+                            "section_text": section["text"],
+                            "page_start": section["page_start"],
+                            "page_end": section["page_end"]
+                        }
+
+                        output_file.write(
+                            json.dumps(
+                                record,
+                                ensure_ascii=False
+                            ) + "\n"
+                        )
+
+                        total_examples += 1
 
                     print(
-                        f"Question generation failed "
-                        f"for {matched_title}: {error}"
+                        f"Generated {len(questions)} questions "
+                        f"for {section['path']}"
                     )
 
-                    continue
+                    time.sleep(0.5)
 
-                added = 0
-
-                for example in examples:
-
-                    if count >= limit:
-                        break
-
-                    question = example["question"]
-
-                    key = normalize_question(
-                        question
+                except Exception as error:
+                    print(
+                        f"Skipping {section['path']}: {error}"
                     )
-
-                    # Avoid duplicate questions.
-
-                    if key in seen_questions:
-                        continue
-
-                    seen_questions.add(key)
-
-                    output_record = {
-
-                        "question": question,
-
-                        "answer": example["answer"],
-
-                        "gold_leaf": matched_title,
-
-                        "doc_id": doc_id,
-
-                        "toc": training_toc
-
-                    }
-
-                    output_file.write(
-
-                        json.dumps(
-                            output_record,
-                            ensure_ascii=False
-                        ) + "\n"
-
-                    )
-
-                    output_file.flush()
-
-                    count += 1
-                    added += 1
-
-                    if added >= 2:
-                        break
-
-                print(
-                    f"{matched_title}: "
-                    f"{added} examples generated"
-                )
-
-    print("\nTraining data generation completed.")
 
     print(
-        f"Total training examples: {count}"
+        f"\nTotal training examples: {total_examples}"
     )
 
     print(
-        f"Output file: {output_path}"
+        f"Saved to: {output_path}"
     )
 
-
-# --------------------------------------------------
-# 8. Run Script
-# --------------------------------------------------
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--source",
-        default="data/structured.jsonl"
-    )
-
-    parser.add_argument(
-        "--output",
-        default="data/stair_train.jsonl"
-    )
-
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=500
-    )
-
-    args = parser.parse_args()
-
-    main(
-
-        source=args.source,
-
-        output=args.output,
-
-        limit=args.limit
-
-    )
+    main()
