@@ -16,3 +16,4 @@ peft>=0.12
 bitsandbytes>=0.43
 trl>=0.10
 torch
+rank-bm25>=0.2.2
