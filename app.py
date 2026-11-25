@@ -1,14 +1,17 @@
 
 import os
 import tempfile
-import streamlit as st
 from pathlib import Path
+
+import streamlit as st
 
 from document_parser import read_file
 from toc_generator import build_toc, toc_text
+
 from stair_core import (
     predict_leaf,
     retrieve_evidence,
+    split_retrieval_results,
     answer_with_openrouter
 )
 
@@ -68,7 +71,7 @@ if "documents" not in st.session_state:
 
 
 # ==================================================
-# 4. FILE PROCESSING FUNCTION
+# 4. PROCESS UPLOADED DOCUMENT
 # ==================================================
 
 def process_uploaded_file(uploaded_file):
@@ -79,7 +82,6 @@ def process_uploaded_file(uploaded_file):
 
     try:
 
-        # Save UploadedFile as a temporary file
         with tempfile.NamedTemporaryFile(
             delete=False,
             suffix=suffix
@@ -89,27 +91,20 @@ def process_uploaded_file(uploaded_file):
 
             temp_path = Path(temp_file.name)
 
-        # Pass Path object to document parser
         extracted_text = read_file(temp_path)
 
-        if not extracted_text:
+        if not extracted_text or not extracted_text.strip():
+
             raise ValueError(
                 "No text was extracted from the document."
             )
 
-        if not extracted_text.strip():
-            raise ValueError(
-                "The extracted document text is empty."
-            )
-
-        # Generate Table of Contents
         document_toc = build_toc(extracted_text)
 
         return extracted_text, document_toc
 
     finally:
 
-        # Remove temporary file
         if temp_path and temp_path.exists():
             temp_path.unlink()
 
@@ -125,7 +120,6 @@ uploaded_files = st.sidebar.file_uploader(
     type=["pdf", "txt", "docx"],
     accept_multiple_files=True
 )
-
 
 if uploaded_files:
 
@@ -146,8 +140,11 @@ if uploaded_files:
                     )
 
                     st.session_state.documents[file_name] = {
+
                         "text": extracted_text,
+
                         "toc": document_toc
+
                     }
 
                 st.sidebar.success(
@@ -237,7 +234,7 @@ with st.expander("📋 Document Diagnostics"):
 
         st.warning(
             "Page markers are missing. "
-            "Check whether document_parser.py preserves PDF page numbers."
+            "Check document_parser.py."
         )
 
 
@@ -252,19 +249,32 @@ st.header("🔍 Ask Questions About the Annual Report")
 question = st.text_area(
     "Enter your financial question:",
     placeholder=(
-        "Example: How much did L&T spend on "
-        "environmental management in FY 2024-25?"
+        "Example: How much energy did the company "
+        "consume in FY 2024-25?"
     ),
     height=100
 )
 
+col1, col2 = st.columns(2)
 
-top_k = st.slider(
-    "Number of evidence chunks to retrieve",
-    min_value=3,
-    max_value=10,
-    value=5
-)
+with col1:
+
+    top_k = st.slider(
+        "Number of evidence chunks",
+        min_value=3,
+        max_value=20,
+        value=10
+    )
+
+with col2:
+
+    relevance_threshold = st.slider(
+        "Relevance threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.50,
+        step=0.05
+    )
 
 
 # ==================================================
@@ -283,200 +293,337 @@ if st.button(
             "Please enter a question."
         )
 
-    else:
+        st.stop()
 
-        # ------------------------------------------
-        # A. PREDICT RELEVANT TOC SECTION
-        # ------------------------------------------
+    # ------------------------------------------
+    # A. PREDICT TOC SECTION
+    # ------------------------------------------
 
-        st.subheader("1. Predicted ToC Section")
+    st.subheader("1. Predicted ToC Section")
 
-        with st.spinner(
-            "Predicting the relevant section..."
-        ):
+    with st.spinner(
+        "Predicting the relevant section..."
+    ):
 
-            try:
+        try:
 
-                predicted_leaf = predict_leaf(
-                    question,
-                    toc
-                )
-
-                if predicted_leaf:
-
-                    st.success(predicted_leaf)
-
-                else:
-
-                    st.warning(
-                        "No relevant ToC section predicted."
-                    )
-
-            except Exception as error:
-
-                predicted_leaf = None
-
-                st.error(
-                    f"ToC prediction error: {error}"
-                )
-
-
-        # ------------------------------------------
-        # B. HYBRID RETRIEVAL
-        # ------------------------------------------
-
-        st.subheader("2. Retrieved Evidence")
-
-        with st.spinner(
-            "Searching document using hybrid retrieval..."
-        ):
-
-            try:
-
-                evidence = retrieve_evidence(
-                    question=question,
-                    text=text,
-                    toc=toc,
-                    predicted_leaf=predicted_leaf,
-                    top_k=top_k
-                )
-
-            except Exception as error:
-
-                evidence = []
-
-                st.error(
-                    f"Retrieval error: {error}"
-                )
-
-
-        # ------------------------------------------
-        # C. DISPLAY RETRIEVED CHUNKS
-        # ------------------------------------------
-
-        if evidence:
-
-            for index, item in enumerate(
-                evidence,
-                start=1
-            ):
-
-                title = item.get(
-                    "title",
-                    "Unknown Section"
-                )
-
-                score = item.get(
-                    "score",
-                    0.0
-                )
-
-                page = item.get("page")
-
-                with st.expander(
-                    f"Evidence {index}: {title} | Score: {score:.4f}",
-                    expanded=(index == 1)
-                ):
-
-                    st.write(
-                        "**Source:**",
-                        item.get("source", "Unknown")
-                    )
-
-                    st.write(
-                        "**PDF Page:**",
-                        page if page is not None else "Unavailable"
-                    )
-
-                    st.markdown("**Retrieved Text:**")
-
-                    st.text(
-                        item.get("text", "")[:5000]
-                    )
-
-        else:
-
-            st.error(
-                "No relevant evidence was retrieved. "
-                "Check document extraction and retrieval."
+            predicted_leaf = predict_leaf(
+                question,
+                toc
             )
 
+            if predicted_leaf:
 
-        # ------------------------------------------
-        # D. GENERATE FINAL ANSWER
-        # ------------------------------------------
-
-        st.subheader("3. Generated Answer")
-
-        if evidence:
-
-            if not api_key:
-
-                st.error(
-                    "OPENROUTER_API_KEY is missing. "
-                    "Add it in Streamlit Cloud Secrets."
+                st.success(
+                    f"Predicted Section: {predicted_leaf}"
                 )
 
             else:
 
-                with st.spinner(
-                    "Generating answer using OpenRouter..."
-                ):
+                st.warning(
+                    "No relevant ToC section predicted."
+                )
 
-                    try:
+        except Exception as error:
 
-                        answer = answer_with_openrouter(
-                            question,
-                            evidence
-                        )
+            predicted_leaf = None
 
-                        st.markdown(answer)
-
-                    except Exception as error:
-
-                        st.error(
-                            f"Answer generation failed: {error}"
-                        )
-
-        else:
-
-            st.warning(
-                "Answer generation skipped because "
-                "no relevant evidence was retrieved."
+            st.error(
+                f"ToC prediction error: {error}"
             )
 
+    # ------------------------------------------
+    # B. HYBRID RETRIEVAL
+    # ------------------------------------------
 
-        # ------------------------------------------
-        # E. RETRIEVAL DIAGNOSTICS
-        # ------------------------------------------
+    st.subheader("2. Hybrid Retrieval")
 
-        st.subheader("4. Retrieval Diagnostics")
+    try:
 
-        if evidence:
+        with st.spinner(
+            "Running Vector Search + BM25 + RRF + Reranking..."
+        ):
 
-            best = evidence[0]
+            evidence = retrieve_evidence(
 
-            col1, col2 = st.columns(2)
+                question=question,
 
-            col1.metric(
-                "Best Matching Score",
-                f"{best.get('score', 0):.4f}"
+                text=text,
+
+                toc=toc,
+
+                predicted_leaf=predicted_leaf,
+
+                top_k=top_k,
+
+                threshold=relevance_threshold
+
             )
 
-            col2.metric(
-                "Retrieved Chunks",
-                len(evidence)
+    except Exception as error:
+
+        evidence = []
+
+        st.error(
+            f"Retrieval error: {error}"
+        )
+
+    # ------------------------------------------
+    # C. SEPARATE RELEVANT AND IRRELEVANT
+    # ------------------------------------------
+
+    relevant = []
+
+    irrelevant = []
+
+    if evidence:
+
+        relevant, irrelevant = split_retrieval_results(
+            evidence
+        )
+
+    # ------------------------------------------
+    # D. DISPLAY RETRIEVAL SUMMARY
+    # ------------------------------------------
+
+    st.subheader("3. Retrieval Summary")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Total Retrieved",
+        len(evidence)
+    )
+
+    col2.metric(
+        "Relevant Chunks",
+        len(relevant)
+    )
+
+    col3.metric(
+        "Rejected Chunks",
+        len(irrelevant)
+    )
+
+    # ------------------------------------------
+    # E. DISPLAY RELEVANT CHUNKS
+    # ------------------------------------------
+
+    st.subheader("🟢 Relevant Chunks")
+
+    if relevant:
+
+        for index, item in enumerate(
+            relevant,
+            start=1
+        ):
+
+            title = item.get(
+                "title",
+                "Unknown Section"
             )
 
-            st.write(
-                "**Best Matching Section:**",
-                best.get("title", "Unknown")
+            page = item.get("page")
+
+            score = item.get(
+                "relevance_score",
+                0.0
             )
 
-            st.write(
-                "**Best Matching PDF Page:**",
-                best.get("page") or "Unavailable"
+            with st.expander(
+
+                f"Relevant {index}: {title} | "
+                f"Relevance: {score:.4f}",
+
+                expanded=(index == 1)
+
+            ):
+
+                col1, col2 = st.columns(2)
+
+                col1.metric(
+                    "Cross-Encoder Score",
+                    f"{score:.4f}"
+                )
+
+                col2.metric(
+                    "RRF Score",
+                    f"{item.get('rrf_score', 0):.4f}"
+                )
+
+                st.write(
+                    "**Vector Score:**",
+                    f"{item.get('vector_score', 0):.4f}"
+                )
+
+                st.write(
+                    "**BM25 Score:**",
+                    f"{item.get('bm25_score', 0):.4f}"
+                )
+
+                st.write(
+                    "**Financial Metric Bonus:**",
+                    f"{item.get('financial_score', 0):.4f}"
+                )
+
+                st.write(
+                    "**PDF Page:**",
+                    page if page is not None else "Unavailable"
+                )
+
+                st.markdown("**Retrieved Text:**")
+
+                st.write(
+                    item.get("text", "")
+                )
+
+    else:
+
+        st.warning(
+            "No chunks passed the relevance threshold."
+        )
+
+    # ------------------------------------------
+    # F. DISPLAY REJECTED CHUNKS
+    # ------------------------------------------
+
+    st.subheader("🔴 Rejected / Low-Relevance Chunks")
+
+    if irrelevant:
+
+        for index, item in enumerate(
+            irrelevant,
+            start=1
+        ):
+
+            title = item.get(
+                "title",
+                "Unknown Section"
             )
+
+            score = item.get(
+                "relevance_score",
+                0.0
+            )
+
+            with st.expander(
+
+                f"Rejected {index}: {title} | "
+                f"Relevance: {score:.4f}",
+
+                expanded=False
+
+            ):
+
+                st.write(
+                    "**Cross-Encoder Score:**",
+                    f"{score:.4f}"
+                )
+
+                st.write(
+                    "**RRF Score:**",
+                    f"{item.get('rrf_score', 0):.4f}"
+                )
+
+                st.write(
+                    "**PDF Page:**",
+                    item.get("page") or "Unavailable"
+                )
+
+                st.write(
+                    item.get("text", "")
+                )
+
+    else:
+
+        st.info(
+            "No rejected chunks in the retrieved results."
+        )
+
+    # ------------------------------------------
+    # G. GENERATE FINAL ANSWER
+    # ------------------------------------------
+
+    st.subheader("4. Generated Answer")
+
+    if not relevant:
+
+        st.error(
+            "Answer generation skipped. "
+            "The retrieved chunks do not contain "
+            "sufficient evidence."
+        )
+
+    elif not api_key:
+
+        st.error(
+            "OPENROUTER_API_KEY is missing. "
+            "Add it in Streamlit Cloud Secrets."
+        )
+
+    else:
+
+        with st.spinner(
+            "Generating an evidence-based answer..."
+        ):
+
+            try:
+
+                answer = answer_with_openrouter(
+                    question,
+                    relevant
+                )
+
+                st.markdown(answer)
+
+            except Exception as error:
+
+                st.error(
+                    f"Answer generation failed: {error}"
+                )
+
+    # ------------------------------------------
+    # H. RETRIEVAL DIAGNOSTICS
+    # ------------------------------------------
+
+    st.subheader("5. Retrieval Diagnostics")
+
+    if evidence:
+
+        best = evidence[0]
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric(
+            "Best Relevance Score",
+            f"{best.get('relevance_score', 0):.4f}"
+        )
+
+        col2.metric(
+            "Best Vector Score",
+            f"{best.get('vector_score', 0):.4f}"
+        )
+
+        col3.metric(
+            "Best RRF Score",
+            f"{best.get('rrf_score', 0):.4f}"
+        )
+
+        st.write(
+            "**Best Matching Section:**",
+            best.get("title", "Unknown")
+        )
+
+        st.write(
+            "**Best Matching PDF Page:**",
+            best.get("page") or "Unavailable"
+        )
+
+    else:
+
+        st.warning(
+            "No retrieval results available."
+        )
 
 
 # ==================================================
